@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
 from megatron.training import checkpointing
 from megatron.training.state import TrainState
@@ -266,3 +267,142 @@ def test_model_extra_state_cleanup_does_not_transform_opaque_dataloader_state(ru
     state = checkpointing.generate_state_dict(args, [], None, None, None, dataloader_state=payload)
 
     assert state['dataloader_state_dict']['opaque'] is opaque
+
+
+@pytest.mark.parametrize('rank_independent', [False, True])
+@pytest.mark.parametrize('data_rank', [0, 3])
+def test_native_dataloader_state_round_trip_preserves_opaque_values(rank_independent, data_rank):
+    """Native DCP stores each opaque state as one byte entry without flattening its contents."""
+    state_rank = 0 if rank_independent else data_rank
+    cursor = 16 + state_rank
+    payload = {
+        'dataloader_state_dict': {
+            'cursor': cursor,
+            'workers': [{'rng': torch.tensor([1234, state_rank]), 'buffer': b'token-bytes'}],
+            'pending': (None, [True, 1.25]),
+        },
+        'is_rank_independent': rank_independent,
+        'data_parallel_size': 4,
+    }
+    group = SimpleNamespace(rank=data_rank, size=4)
+    with mock.patch.object(checkpointing, 'get_pg_rank', side_effect=lambda group: group.rank):
+        encoded = checkpointing._get_native_dataloader_state(payload, dp_group=group)
+
+    key = 'shared' if rank_independent else f'rank_{data_rank:05d}'
+    assert set(encoded) == {key}
+    assert isinstance(encoded[key], bytes)
+    payload['dataloader_state_dict']['cursor'] = 1000
+    payload['dataloader_state_dict']['workers'][0]['rng'].zero_()
+    decoded = checkpointing._decode_dataloader_state(encoded)
+
+    assert decoded['is_rank_independent'] is rank_independent
+    assert decoded['data_parallel_size'] == 4
+    assert decoded['dataloader_state_dict']['cursor'] == cursor
+    assert torch.equal(
+        decoded['dataloader_state_dict']['workers'][0]['rng'], torch.tensor([1234, state_rank])
+    )
+    assert decoded['dataloader_state_dict']['workers'][0]['buffer'] == b'token-bytes'
+    assert decoded['dataloader_state_dict']['pending'] == (None, [True, 1.25])
+
+
+def test_native_dataloader_state_distinguishes_absent_and_empty_payload():
+    assert checkpointing._get_native_dataloader_state(None) is None
+    assert checkpointing._decode_dataloader_state(None) is None
+    payload = {'dataloader_state_dict': {}, 'is_rank_independent': True, 'data_parallel_size': 1}
+
+    encoded = checkpointing._get_native_dataloader_state(payload)
+
+    assert set(encoded) == {'shared'}
+    assert checkpointing._decode_dataloader_state(encoded) == payload
+    # The torch_dist adapter already supplies the decoded payload.
+    assert checkpointing._decode_dataloader_state(payload) is payload
+
+
+@pytest.mark.parametrize('ckpt_format', ['torch_dcp', 'fsdp_dtensor'])
+def test_old_native_checkpoint_without_loader_state_needs_no_data_groups(ckpt_format):
+    with (
+        mock.patch.object(checkpointing, '_get_filesystem_reader') as reader,
+        mock.patch.object(checkpointing, 'get_pg_rank') as get_rank,
+        mock.patch.object(checkpointing, 'get_pg_size') as get_size,
+    ):
+        reader.return_value.read_metadata.return_value = _metadata()
+        assert (
+            checkpointing._get_dataloader_state_load_request(
+                'old-checkpoint', ckpt_format=ckpt_format
+            )
+            == {}
+        )
+
+    get_rank.assert_not_called()
+    get_size.assert_not_called()
+
+
+@pytest.mark.parametrize('ckpt_format', ['torch_dcp', 'fsdp_dtensor'])
+def test_native_shared_cursor_loads_on_resharded_data_rank(ckpt_format):
+    group = SimpleNamespace(rank=7, size=8)
+    with (
+        mock.patch.object(checkpointing, '_get_filesystem_reader') as reader,
+        mock.patch.object(checkpointing, 'get_pg_rank', side_effect=lambda group: group.rank),
+        mock.patch.object(checkpointing, 'get_pg_size', side_effect=lambda group: group.size),
+    ):
+        reader.return_value.read_metadata.return_value = _metadata('dataloader_state_dict.shared')
+        request = checkpointing._get_dataloader_state_load_request(
+            'checkpoint', dp_group=group, ckpt_format=ckpt_format
+        )
+
+    assert request == {'dataloader_state_dict': {'shared': None}}
+
+
+@pytest.mark.parametrize('ckpt_format', ['torch_dcp', 'fsdp_dtensor'])
+@pytest.mark.parametrize('data_rank', [0, 3])
+def test_native_rank_dependent_cursor_requests_only_its_rank(ckpt_format, data_rank):
+    group = SimpleNamespace(rank=data_rank, size=4)
+    with (
+        mock.patch.object(checkpointing, '_get_filesystem_reader') as reader,
+        mock.patch.object(checkpointing, 'get_pg_rank', side_effect=lambda group: group.rank),
+        mock.patch.object(checkpointing, 'get_pg_size', side_effect=lambda group: group.size),
+    ):
+        reader.return_value.read_metadata.return_value = _metadata(
+            *(f'dataloader_state_dict.rank_{rank:05d}' for rank in range(4))
+        )
+        request = checkpointing._get_dataloader_state_load_request(
+            'checkpoint', dp_group=group, ckpt_format=ckpt_format
+        )
+
+    assert request == {'dataloader_state_dict': {f'rank_{data_rank:05d}': None}}
+
+
+@pytest.mark.parametrize('ckpt_format', ['torch_dcp', 'fsdp_dtensor'])
+@pytest.mark.parametrize('current_size', [2, 8])
+def test_native_rank_dependent_cursor_rejects_data_parallel_resize(ckpt_format, current_size):
+    group = SimpleNamespace(rank=0, size=current_size)
+    with (
+        mock.patch.object(checkpointing, '_get_filesystem_reader') as reader,
+        mock.patch.object(checkpointing, 'get_pg_rank', side_effect=lambda group: group.rank),
+        mock.patch.object(checkpointing, 'get_pg_size', side_effect=lambda group: group.size),
+    ):
+        reader.return_value.read_metadata.return_value = _metadata(
+            *(f'dataloader_state_dict.rank_{rank:05d}' for rank in range(4))
+        )
+        with pytest.raises(RuntimeError, match=f'checkpoint 4, current {current_size}'):
+            checkpointing._get_dataloader_state_load_request(
+                'checkpoint', dp_group=group, ckpt_format=ckpt_format
+            )
+
+
+@pytest.mark.parametrize('ckpt_format', ['torch_dcp', 'fsdp_dtensor'])
+def test_native_checkpoint_with_missing_rank_cannot_fall_back_to_sidecar(ckpt_format):
+    """An incomplete embedded layout is an error even under FSDP's partial model load."""
+    group = SimpleNamespace(rank=3, size=4)
+    with (
+        mock.patch.object(checkpointing, '_get_filesystem_reader') as reader,
+        mock.patch.object(checkpointing, 'get_pg_rank', side_effect=lambda group: group.rank),
+        mock.patch.object(checkpointing, 'get_pg_size', side_effect=lambda group: group.size),
+    ):
+        reader.return_value.read_metadata.return_value = _metadata(
+            *(f'dataloader_state_dict.rank_{rank:05d}' for rank in (0, 1, 2, 4))
+        )
+        with pytest.raises(RuntimeError, match='rank'):
+            checkpointing._get_dataloader_state_load_request(
+                'checkpoint', dp_group=group, ckpt_format=ckpt_format
+            )

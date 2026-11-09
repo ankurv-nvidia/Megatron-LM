@@ -5,6 +5,7 @@
 import contextlib
 import copy
 import inspect
+import io
 import os
 import random
 import re
@@ -808,8 +809,8 @@ def save_checkpoint(
     "local" - Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk).
 
     External dataloaders with ``save_state`` opt in through ``args.dataloader_save``.
-    For ``torch_dist``, their opaque state is part of the regular checkpoint and follows its
-    asynchronous write/finalization. Other formats retain separate dataloader state files.
+    Distributed checkpoint formats store their opaque state in the regular checkpoint and
+    follow its asynchronous write/finalization. Legacy saves retain separate dataloader files.
 
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
@@ -884,10 +885,12 @@ def save_checkpoint(
             )
 
     ckpt_format = save_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
-    # Capture and the state-dict field are backend-independent; enable the adapter for
-    # the verified backend while preserving other formats' existing dataloader files.
+    # Capture and the state-dict field are backend-independent. Each distributed backend
+    # supplies its representation; legacy and frozen-weight runs retain separate files.
     save_dataloader_in_checkpoint = (
-        not skip_weight_ckpt and ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist'
+        not skip_weight_ckpt
+        and ckpt_type == CheckpointType.GLOBAL
+        and ckpt_format in ('torch_dist', 'torch_dcp', 'fsdp_dtensor')
     )
     print_rank_0(
         f'[{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving checkpoint '
@@ -1018,9 +1021,14 @@ def save_checkpoint(
                 dp_group=dp_gtp_remat_group,
                 cp_group=cp_group,
             )
-            dataloader_state = _get_sharded_dataloader_state(
-                dataloader_state, dp_group=dp_gtp_remat_group
-            )
+            if ckpt_format == 'torch_dist':
+                dataloader_state = _get_sharded_dataloader_state(
+                    dataloader_state, dp_group=dp_gtp_remat_group
+                )
+            else:
+                dataloader_state = _get_native_dataloader_state(
+                    dataloader_state, dp_group=dp_gtp_remat_group
+                )
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
                 args,
@@ -1774,6 +1782,35 @@ def _get_sharded_dataloader_state(payload: dict | None, *, dp_group=None) -> Sha
     )
 
 
+def _get_native_dataloader_state(payload: dict | None, *, dp_group=None) -> dict | None:
+    """Encode one opaque state per data rank for native PyTorch checkpoint planners."""
+    if payload is None:
+        return None
+    if payload['is_rank_independent']:
+        key = 'shared'
+    else:
+        dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+        key = f'rank_{dp_rank:05d}'
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    # A raw dict would be flattened into replicated keys, losing distinct rank states and
+    # requiring tensor shapes before a dataloader exists. Bytes are a single opaque leaf.
+    return {key: buffer.getvalue()}
+
+
+def _decode_dataloader_state(state: dict | None) -> dict | None:
+    """Normalize native opaque bytes and MCore objects to the same dataloader bundle."""
+    if state is None or not state:
+        return None
+    if 'is_rank_independent' in state:
+        return state
+    if len(state) != 1:
+        raise RuntimeError('Expected exactly one native dataloader state shard')
+    return torch.load(
+        io.BytesIO(next(iter(state.values()))), map_location='cpu', weights_only=False
+    )
+
+
 def _get_dataloader_state_load_request(
     checkpoint_name,
     *,
@@ -1782,11 +1819,36 @@ def _get_dataloader_state_load_request(
     dp_group=None,
     cp_group=None,
     checkpoint_group=None,
+    ckpt_format='torch_dist',
 ):
     """Request the data shard on all stages, including stages without a dataloader writer."""
     # Inspect just the object key instead of materializing tensor metadata for every model
     # parameter. Use the checkpoint reader factory so MSC checkpoints follow the same path.
     metadata = _get_filesystem_reader(checkpoint_name).read_metadata()
+    if ckpt_format in ('torch_dcp', 'fsdp_dtensor'):
+        prefix = 'dataloader_state_dict.'
+        if prefix + 'shared' in metadata.state_dict_metadata:
+            return {'dataloader_state_dict': {'shared': None}}
+        rank_keys = {
+            key[len(prefix) :]
+            for key in metadata.state_dict_metadata
+            if key.startswith(prefix + 'rank_')
+        }
+        if not rank_keys:
+            return {}
+        dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+        dp_size = (
+            get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
+        )
+        if len(rank_keys) != dp_size:
+            raise RuntimeError(
+                f'Cannot restore rank-dependent dataloader state with a different data-parallel '
+                f'size (checkpoint {len(rank_keys)}, current {dp_size})'
+            )
+        key = f'rank_{dp_rank:05d}'
+        if key not in rank_keys:
+            raise RuntimeError(f'Checkpoint is missing dataloader state for data rank {dp_rank}')
+        return {'dataloader_state_dict': {key: None}}
     shard_key = next(
         (
             key
@@ -3457,15 +3519,30 @@ def load_checkpoint(
             'model': model_sd,
             'args': None,
             'iteration': 1,
-            'rng_state': get_rng_state(
-                load_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
-            ),
             'checkpoint_version': None,
             'num_floating_point_operations_so_far': 0,
         }
-        if restore_training_state:
-            sharded_state_dict['optimizer'] = optimizer.state_dict(is_loading=True)
-            sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+        if load_rng and not finetune and not release:
+            sharded_state_dict['rng_state'] = get_rng_state(
+                load_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+            )
+        if restore_training_state and load_optim and not finetune and not release:
+            if optimizer is not None:
+                # Native DCP needs populated slots in its load template. Match the
+                # initialization used by sharded_state_dict without requiring every
+                # optimizer's ordinary state_dict to accept an is_loading argument.
+                pending_optimizers = [optimizer]
+                while pending_optimizers:
+                    current_optimizer = pending_optimizers.pop()
+                    if hasattr(current_optimizer, 'chained_optimizers'):
+                        pending_optimizers.extend(current_optimizer.chained_optimizers)
+                        continue
+                    init_state_fn = getattr(current_optimizer, 'init_state_fn', None)
+                    if init_state_fn is not None and not current_optimizer.is_stub_optimizer:
+                        init_state_fn(current_optimizer.optimizer, current_optimizer.config)
+                sharded_state_dict['optimizer'] = optimizer.state_dict()
+            if opt_param_scheduler is not None:
+                sharded_state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif load_format == 'fsdp_dtensor':
         reader = FileSystemReader(_get_load_checkpoint_path(load_dir, checkpoint))
@@ -3547,6 +3624,29 @@ def load_checkpoint(
         state_dict['_model'] = model
         load_kwargs['sharded_state_dict'] = state_dict
 
+    if (
+        restore_dataloader_state
+        and ckpt_format in ('torch_dcp', 'fsdp_dtensor')
+        and not release
+        and not finetune
+    ):
+        native_iteration, native_release, _ = _resolve_load_iteration(load_dir)
+        if checkpoint.ckpt_step:
+            native_iteration = checkpoint.ckpt_step
+        if (
+            native_iteration != -1
+            and not native_release
+            and override_ckpt_iteration in (None, native_iteration)
+        ):
+            native_checkpoint_name = get_checkpoint_name(
+                load_dir, native_iteration, return_base_dir=True
+            )
+            load_kwargs['sharded_state_dict'].update(
+                _get_dataloader_state_load_request(
+                    native_checkpoint_name, dp_group=dp_gtp_remat_group, ckpt_format=ckpt_format
+                )
+            )
+
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir,
         args,
@@ -3622,7 +3722,9 @@ def load_checkpoint(
         num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     loaded_dataloader_state = (
-        state_dict.get('dataloader_state_dict') if restore_dataloader_state else None
+        _decode_dataloader_state(state_dict.get('dataloader_state_dict'))
+        if restore_dataloader_state
+        else None
     )
 
     # Check arguments.
@@ -3689,15 +3791,26 @@ def load_checkpoint(
         print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} ')
 
     if restore_dataloader_state and not release and not finetune:
-        if iteration != state_dict.get('iteration'):
+        if iteration != state_dict.get('iteration') or (
+            override_ckpt_iteration is not None and loaded_dataloader_state is None
+        ):
             # Rewind data independently of model weights by reading only the target
             # checkpoint's loader object. Older checkpoints retain their sidecar fallback.
             loaded_dataloader_state = None
-            if iteration > 0 and ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
+            if iteration > 0 and ckpt_type in (
+                CheckpointType.GLOBAL,
+                CheckpointType.TORCH_DCP,
+                CheckpointType.FSDP_DTENSOR,
+            ):
                 data_checkpoint_name = get_checkpoint_name(
                     load_dir, iteration, return_base_dir=True
                 )
-                if dist_checkpointing.check_is_distributed_checkpoint(data_checkpoint_name):
+                has_checkpoint = (
+                    dist_checkpointing.check_is_distributed_checkpoint(data_checkpoint_name)
+                    if ckpt_format == 'torch_dist'
+                    else file_exists(os.path.join(data_checkpoint_name, '.metadata'))
+                )
+                if has_checkpoint:
                     request = _get_dataloader_state_load_request(
                         data_checkpoint_name,
                         tp_group=tp_group,
@@ -3705,11 +3818,23 @@ def load_checkpoint(
                         dp_group=dp_gtp_remat_group,
                         cp_group=cp_group,
                         checkpoint_group=checkpoint_group,
+                        ckpt_format=ckpt_format,
                     )
                     if request:
-                        loaded_dataloader_state = TorchDistLoadShardedStrategy().load(
-                            request, data_checkpoint_name
-                        )['dataloader_state_dict']
+                        if ckpt_format == 'torch_dist':
+                            loaded = TorchDistLoadShardedStrategy().load(
+                                request, data_checkpoint_name
+                            )
+                        else:
+                            torch.distributed.checkpoint.load_state_dict(
+                                request,
+                                storage_reader=_get_filesystem_reader(data_checkpoint_name),
+                                no_dist=True,
+                            )
+                            loaded = request
+                        loaded_dataloader_state = _decode_dataloader_state(
+                            loaded['dataloader_state_dict']
+                        )
         if loaded_dataloader_state is not None:
             data_parallel_size = (
                 get_pg_size(dp_gtp_remat_group)

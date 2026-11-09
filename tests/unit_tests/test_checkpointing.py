@@ -22,6 +22,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.parallel_state import get_data_parallel_world_size
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule, WideResidualConfig
@@ -993,7 +994,7 @@ def test_save_checkpoint(
         args.save_tokenizer_assets = False
         set_args(args)
 
-        # Text-only checkpoint saves still bypass dataloader state, while passing CP through.
+        # Text-only saves have no loader payload. Legacy saves retain the helper and its CP group.
         cp_group = mock.sentinel.cp_group
         with mock.patch(
             "megatron.training.checkpointing.maybe_save_dataloader_state",
@@ -1008,7 +1009,10 @@ def test_save_checkpoint(
                 num_floating_point_operations_so_far,
                 cp_group=cp_group,
             )
-        assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
+        if ckpt_format == "torch":
+            assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
+        else:
+            save_dataloader_state.assert_not_called()
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())
@@ -2244,14 +2248,35 @@ def dataloader_parallel_layout(request):
     unset_num_microbatches_calculator()
 
 
+def _wrap_dataloader_checkpoint_fsdp(model, config, pipeline_parallel_size):
+    # V1's DP/TP mesh assumes one pipeline stage; V2 builds its mesh from the DP group.
+    use_v2 = pipeline_parallel_size > 1
+    if use_v2:
+        config.pipeline_model_parallel_size = pipeline_parallel_size
+        config.gradient_accumulation_fusion = False
+        model = model.cuda()
+    return FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2 if use_v2 else 1,
+        ),
+        module=model,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups() if use_v2 else None,
+    )
+
+
 @pytest.mark.parametrize("rank_independent", [False, True])
 @pytest.mark.parametrize("async_save", [False, True])
+@pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch_dcp", "fsdp_dtensor"])
 def test_dataloader_state_round_trip_in_regular_checkpoint(
     dataloader_parallel_layout,
     tmp_path_dist_ckpt,
     create_ckpt_load_args,
     rank_independent,
     async_save,
+    ckpt_format,
     monkeypatch,
     run_config,
 ):
@@ -2263,7 +2288,7 @@ def test_dataloader_state_round_trip_in_regular_checkpoint(
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.optimizer.use_distributed_optimizer = False
-    args.ckpt_format = "torch_dist"
+    args.ckpt_format = ckpt_format
     args.use_dist_ckpt = True
     args.use_distributed_optimizer = False
     args.dataloader_type = "external"
@@ -2280,6 +2305,7 @@ def test_dataloader_state_round_trip_in_regular_checkpoint(
     ) = dataloader_parallel_layout
     args.data_parallel_size = checkpointing.mpu.get_data_parallel_world_size()
     args.use_persistent_ckpt_worker = False
+    args.use_megatron_fsdp = ckpt_format == "fsdp_dtensor"
     dp_rank = 0 if rank_independent else checkpointing.mpu.get_data_parallel_rank()
     raw_state = {
         "cursor": 16 + dp_rank,
@@ -2291,7 +2317,7 @@ def test_dataloader_state_round_trip_in_regular_checkpoint(
             save_state=lambda: raw_state, is_save_state_rank_independent=rank_independent
         )
     )
-    name = f"dataloader_roundtrip_{dataloader_parallel_layout}_{rank_independent}_{async_save}"
+    name = f"dataloader_roundtrip_{ckpt_format}_{dataloader_parallel_layout}_{rank_independent}_{async_save}"
     with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
         args.save = ckpt_dir / "integrated"
         args.load = args.save
@@ -2315,6 +2341,11 @@ def test_dataloader_state_round_trip_in_regular_checkpoint(
         config = TransformerConfig(num_layers=1, kv_channels=1)
         model = MockModel(config)
         optimizer = MockState({"optimizer": "optimizer_state"})
+        if ckpt_format == "fsdp_dtensor":
+            model = _wrap_dataloader_checkpoint_fsdp(
+                model, config, args.pipeline_model_parallel_size
+            )
+            optimizer = MockState({"state": {}})
         scheduler = MockState({"scheduler": "scheduler_state"})
         with mock.patch.object(checkpointing, "maybe_save_dataloader_state") as sidecar_writer:
             train_state.iteration = 2
@@ -2330,7 +2361,7 @@ def test_dataloader_state_round_trip_in_regular_checkpoint(
         iteration_dir = args.save / "iter_0000002"
         assert not list(iteration_dir.rglob("train_dataloader_dprank*.pt"))
         metadata = torch.distributed.checkpoint.FileSystemReader(iteration_dir).read_metadata()
-        assert any(key.startswith("dataloader_state_dict/") for key in metadata.state_dict_metadata)
+        assert any(key.startswith("dataloader_state_dict") for key in metadata.state_dict_metadata)
 
         # Embedded state must work with no --dataloader-save path on the restarting process.
         args.dataloader_save = None
@@ -2371,18 +2402,27 @@ def test_dataloader_state_round_trip_in_regular_checkpoint(
         assert get_loaded_dataloader_state(args) is None
 
 
+@pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch_dcp", "fsdp_dtensor"])
+@pytest.mark.parametrize("target_iteration", [2, 4])
 def test_dataloader_iteration_override_loads_target_checkpoint_state(
-    dataloader_parallel_layout, tmp_path_dist_ckpt, create_ckpt_load_args, monkeypatch, run_config
+    dataloader_parallel_layout,
+    tmp_path_dist_ckpt,
+    create_ckpt_load_args,
+    monkeypatch,
+    run_config,
+    ckpt_format,
+    target_iteration,
 ):
-    """Rewind data to step 2 while loading the step-4 model, without any sidecars."""
+    """Select data progress independently of step-4 weights without any sidecars."""
     args = create_ckpt_load_args
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.optimizer.use_distributed_optimizer = False
     run_config.train.global_batch_size = 1
-    args.ckpt_format = "torch_dist"
+    args.ckpt_format = ckpt_format
     args.use_dist_ckpt = True
     args.use_distributed_optimizer = False
+    args.use_megatron_fsdp = ckpt_format == "fsdp_dtensor"
     args.dataloader_type = "external"
     (
         args.tensor_model_parallel_size,
@@ -2395,8 +2435,14 @@ def test_dataloader_iteration_override_loads_target_checkpoint_state(
     iterator = SimpleNamespace(
         iterable=SimpleNamespace(save_state=lambda: state, is_save_state_rank_independent=True)
     )
-    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
-    with TempNamedDir(tmp_path_dist_ckpt / "dataloader_iteration_override", sync=True) as ckpt_dir:
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    base_model = MockModel(config)
+    model = base_model
+    if ckpt_format == "fsdp_dtensor":
+        model = _wrap_dataloader_checkpoint_fsdp(model, config, args.pipeline_model_parallel_size)
+    with TempNamedDir(
+        tmp_path_dist_ckpt / f"dataloader_iteration_override_{ckpt_format}", sync=True
+    ) as ckpt_dir:
         args.save = args.load = args.dataloader_save = ckpt_dir
         set_args(args)
         sync_checkpoint_config(args)
@@ -2404,13 +2450,13 @@ def test_dataloader_iteration_override_loads_target_checkpoint_state(
             state["cursor"] = iteration * 4
             train_state.iteration = iteration
             with torch.no_grad():
-                model.l.weight.fill_(iteration)
+                base_model.l.weight.fill_(iteration)
             save_checkpoint(iteration, [model], None, None, 0, train_data_iterator=iterator)
         assert not list(ckpt_dir.rglob("train_dataloader_dprank*.pt"))
 
-        run_config.checkpoint.override_ckpt_iteration = 2
+        run_config.checkpoint.override_ckpt_iteration = target_iteration
         loaded_iteration, _ = load_checkpoint([model], None, None, restore_training_state=True)
         assert train_state.iteration == loaded_iteration
-        assert loaded_iteration == 2
-        assert get_loaded_dataloader_state(args) == {"cursor": 8}
-        assert torch.equal(model.l.weight, torch.full_like(model.l.weight, 4))
+        assert loaded_iteration == target_iteration
+        assert get_loaded_dataloader_state(args) == {"cursor": target_iteration * 4}
+        assert torch.equal(base_model.l.weight, torch.full_like(base_model.l.weight, 4))
