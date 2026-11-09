@@ -3207,6 +3207,8 @@ def setup_model_and_optimizer(
                 # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
                 dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
                 dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
+                dp_gtp_remat_group=getattr(ckpt_pgc, "dp_gtp_remat", None),
+                cp_group=ckpt_pgc.cp if ckpt_pgc is not None else None,
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
             )

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed.checkpoint
@@ -30,12 +31,15 @@ from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
+    _get_dataloader_state,
+    _get_sharded_dataloader_state,
     _load_base_checkpoint,
     _maybe_setup_gpt_to_hybrid_load,
     _read_checkpoint_run_config,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
+    get_loaded_dataloader_state,
     load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
@@ -2129,3 +2133,284 @@ def test_the_fsdp_dtensor_reader_follows_the_train_state_tracker(
     with pytest.raises(StopAtTheReader):
         load_checkpoint([object()], None, None, restore_training_state=True)
     assert readers == [wanted]
+
+
+def test_dataloader_state_snapshot_preserves_nested_values_and_explicit_groups():
+    """A snapshot preserves opaque loader state without doing filesystem I/O or barriers."""
+    from megatron.training import checkpointing
+
+    groups = {
+        "tp": SimpleNamespace(rank=0, size=2),
+        "pp": SimpleNamespace(rank=0, size=2),
+        "dp": SimpleNamespace(rank=3, size=4),
+    }
+    state = {
+        "cursor": 16,
+        "worker": {"tensor": torch.tensor([1, 2]), "array": np.array([3, 4])},
+        "pending": [None, (b"buffer", 2.5)],
+    }
+    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: state))
+    with (
+        mock.patch.object(checkpointing, "get_pg_rank", side_effect=lambda group: group.rank),
+        mock.patch.object(checkpointing, "get_pg_size", side_effect=lambda group: group.size),
+        mock.patch.object(checkpointing.mpu, "get_context_parallel_rank", return_value=0),
+        mock.patch.object(checkpointing.torch, "save") as save,
+        mock.patch.object(checkpointing.torch.distributed, "barrier") as barrier,
+    ):
+        raw_snapshot = _get_dataloader_state(
+            iterator, "enabled", tp_group=groups["tp"], pp_group=groups["pp"], dp_group=groups["dp"]
+        )
+        snapshot = _get_sharded_dataloader_state(raw_snapshot, dp_group=groups["dp"])
+
+    assert snapshot.key == "dataloader_state_dict"
+    assert snapshot.global_shape == (4,)
+    assert snapshot.global_offset == (3,)
+    assert snapshot.data is raw_snapshot
+    payload = snapshot.data["dataloader_state_dict"]
+    state["cursor"] = 17
+    state["worker"]["tensor"].zero_()
+    state["worker"]["array"].fill(0)
+    assert payload["cursor"] == 16
+    assert torch.equal(payload["worker"]["tensor"], torch.tensor([1, 2]))
+    np.testing.assert_array_equal(payload["worker"]["array"], [3, 4])
+    assert payload["pending"] == [None, (b"buffer", 2.5)]
+    save.assert_not_called()
+    barrier.assert_not_called()
+
+
+@pytest.mark.parametrize("tp_rank,pp_rank,dp_rank", [(1, 0, 0), (0, 1, 0), (0, 0, 3)])
+def test_dataloader_rank_independent_snapshot_only_calls_owner(tp_rank, pp_rank, dp_rank):
+    from megatron.training import checkpointing
+
+    save_state = mock.Mock(return_value={"cursor": 16})
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=save_state, is_save_state_rank_independent=True)
+    )
+    with mock.patch.object(checkpointing, "get_pg_rank", side_effect=lambda group: group.rank):
+        result = _get_dataloader_state(
+            iterator,
+            "enabled",
+            tp_group=SimpleNamespace(rank=tp_rank),
+            pp_group=SimpleNamespace(rank=pp_rank),
+            dp_group=SimpleNamespace(rank=dp_rank),
+        )
+    assert result is None
+    save_state.assert_not_called()
+
+
+@pytest.mark.parametrize("state", [None, {}])
+def test_dataloader_snapshot_distinguishes_absent_and_empty_state(state):
+    from megatron.training import checkpointing
+
+    group = SimpleNamespace(rank=0, size=1)
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=lambda: state, is_save_state_rank_independent=True)
+    )
+    with (
+        mock.patch.object(checkpointing, "get_pg_rank", side_effect=lambda group: group.rank),
+        mock.patch.object(checkpointing, "get_pg_size", side_effect=lambda group: group.size),
+        mock.patch.object(checkpointing.mpu, "get_context_parallel_rank", return_value=0),
+    ):
+        result = _get_dataloader_state(
+            iterator, "enabled", tp_group=group, pp_group=group, dp_group=group
+        )
+    if state is None:
+        assert result is None
+    else:
+        assert result == {
+            "dataloader_state_dict": {},
+            "is_rank_independent": True,
+            "data_parallel_size": 1,
+        }
+
+
+@pytest.fixture(
+    scope="module",
+    params=[(1, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, 2)],
+    ids=["dp", "tp", "pp", "cp"],
+)
+def dataloader_parallel_layout(request):
+    tp_size, pp_size, cp_size = request.param
+    if Utils.world_size % (tp_size * pp_size * cp_size):
+        pytest.skip("Checkpoint layout requires an even number of ranks")
+    Utils.initialize_model_parallel(tp_size, pp_size, context_parallel_size=cp_size)
+    unset_num_microbatches_calculator()
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
+    model_parallel_cuda_manual_seed(123)
+    yield request.param
+    Utils.destroy_model_parallel()
+    unset_num_microbatches_calculator()
+
+
+@pytest.mark.parametrize("rank_independent", [False, True])
+@pytest.mark.parametrize("async_save", [False, True])
+def test_dataloader_state_round_trip_in_regular_checkpoint(
+    dataloader_parallel_layout,
+    tmp_path_dist_ckpt,
+    create_ckpt_load_args,
+    rank_independent,
+    async_save,
+    monkeypatch,
+    run_config,
+):
+    """Compare the full legacy payload with main-checkpoint state on every data rank."""
+    from megatron.training import checkpointing
+    from megatron.training.async_utils import maybe_finalize_async_save
+
+    args = create_ckpt_load_args
+    train_state = TrainState()
+    monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
+    run_config.optimizer.use_distributed_optimizer = False
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.dataloader_type = "external"
+    args.async_save = async_save
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    args.dist_ckpt_workers = 1
+    train_state.iteration = 0
+    (
+        args.tensor_model_parallel_size,
+        args.pipeline_model_parallel_size,
+        args.context_parallel_size,
+    ) = dataloader_parallel_layout
+    args.data_parallel_size = checkpointing.mpu.get_data_parallel_world_size()
+    args.use_persistent_ckpt_worker = False
+    dp_rank = 0 if rank_independent else checkpointing.mpu.get_data_parallel_rank()
+    raw_state = {
+        "cursor": 16 + dp_rank,
+        "workers": {"rng": torch.tensor([1234, dp_rank]), "offsets": np.array([dp_rank, 7])},
+        "buffer": [b"tokens", (True, None, 1.25)],
+    }
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(
+            save_state=lambda: raw_state, is_save_state_rank_independent=rank_independent
+        )
+    )
+    name = f"dataloader_roundtrip_{dataloader_parallel_layout}_{rank_independent}_{async_save}"
+    with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
+        args.save = ckpt_dir / "integrated"
+        args.load = args.save
+        args.dataloader_save = ckpt_dir / "legacy"
+        set_args(args)
+        sync_checkpoint_config(args)
+
+        maybe_save_dataloader_state(iterator, 2, args.dataloader_save)
+        torch.distributed.barrier()
+        legacy_path = checkpointing.get_checkpoint_name(
+            args.dataloader_save,
+            2,
+            pipeline_parallel=args.pipeline_model_parallel_size > 1,
+            tensor_rank=0,
+            pipeline_rank=0,
+            expert_parallel=False,
+            basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
+        )
+        expected = torch.load(legacy_path, weights_only=False)["dataloader_state_dict"]
+
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        model = MockModel(config)
+        optimizer = MockState({"optimizer": "optimizer_state"})
+        scheduler = MockState({"scheduler": "scheduler_state"})
+        with mock.patch.object(checkpointing, "maybe_save_dataloader_state") as sidecar_writer:
+            train_state.iteration = 2
+            save_checkpoint(2, [model], optimizer, scheduler, 456, train_data_iterator=iterator)
+        sidecar_writer.assert_not_called()
+        # Exercise continued loader progress before an asynchronous write has finalized.
+        raw_state["cursor"] += 100
+        raw_state["workers"]["rng"].fill_(0)
+        raw_state["workers"]["offsets"].fill(0)
+        if async_save:
+            maybe_finalize_async_save(blocking=True, terminate=True)
+
+        iteration_dir = args.save / "iter_0000002"
+        assert not list(iteration_dir.rglob("train_dataloader_dprank*.pt"))
+        metadata = torch.distributed.checkpoint.FileSystemReader(iteration_dir).read_metadata()
+        assert any(key.startswith("dataloader_state_dict/") for key in metadata.state_dict_metadata)
+
+        # Embedded state must work with no --dataloader-save path on the restarting process.
+        args.dataloader_save = None
+        loaded_iteration, loaded_flops = load_checkpoint(
+            [model], optimizer, scheduler, restore_training_state=True
+        )
+        assert train_state.iteration == loaded_iteration
+        assert loaded_iteration == 2
+        assert loaded_flops == 456
+        actual = get_loaded_dataloader_state(args)
+        assert actual["cursor"] == expected["cursor"]
+        assert torch.equal(actual["workers"]["rng"], expected["workers"]["rng"])
+        np.testing.assert_array_equal(actual["workers"]["offsets"], expected["workers"]["offsets"])
+        assert actual["buffer"] == expected["buffer"]
+        # Runtime state never leaks into persisted args, unrelated args, or a later iteration.
+        assert get_loaded_dataloader_state(SimpleNamespace(iteration=2)) is None
+        train_state.iteration = 3
+        assert get_loaded_dataloader_state(args) is None
+
+        if not rank_independent and args.data_parallel_size == 1 and Utils.world_size > 1:
+            # A rank-dependent DP1 state also has shape (1,); its payload must distinguish
+            # it from a shared cursor before permitting expansion to multiple data ranks.
+            with pytest.raises(RuntimeError, match="different data-parallel size"):
+                load_checkpoint(
+                    [model],
+                    optimizer,
+                    scheduler,
+                    restore_training_state=True,
+                    dp_gtp_remat_group=torch.distributed.group.WORLD,
+                )
+
+        args.finetune = True
+        train_state.iteration = 0
+        finetune_iteration, _ = load_checkpoint(
+            [model], optimizer, scheduler, restore_training_state=True, finetune=True
+        )
+        assert finetune_iteration == 0
+        assert get_loaded_dataloader_state(args) is None
+
+
+def test_dataloader_iteration_override_loads_target_checkpoint_state(
+    dataloader_parallel_layout, tmp_path_dist_ckpt, create_ckpt_load_args, monkeypatch, run_config
+):
+    """Rewind data to step 2 while loading the step-4 model, without any sidecars."""
+    args = create_ckpt_load_args
+    train_state = TrainState()
+    monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
+    run_config.optimizer.use_distributed_optimizer = False
+    run_config.train.global_batch_size = 1
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.dataloader_type = "external"
+    (
+        args.tensor_model_parallel_size,
+        args.pipeline_model_parallel_size,
+        args.context_parallel_size,
+    ) = dataloader_parallel_layout
+    args.save_tokenizer_assets = False
+    args.global_batch_size = 1
+    state = {"cursor": 0}
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=lambda: state, is_save_state_rank_independent=True)
+    )
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+    with TempNamedDir(tmp_path_dist_ckpt / "dataloader_iteration_override", sync=True) as ckpt_dir:
+        args.save = args.load = args.dataloader_save = ckpt_dir
+        set_args(args)
+        sync_checkpoint_config(args)
+        for iteration in (2, 4):
+            state["cursor"] = iteration * 4
+            train_state.iteration = iteration
+            with torch.no_grad():
+                model.l.weight.fill_(iteration)
+            save_checkpoint(iteration, [model], None, None, 0, train_data_iterator=iterator)
+        assert not list(ckpt_dir.rglob("train_dataloader_dprank*.pt"))
+
+        run_config.checkpoint.override_ckpt_iteration = 2
+        loaded_iteration, _ = load_checkpoint([model], None, None, restore_training_state=True)
+        assert train_state.iteration == loaded_iteration
+        assert loaded_iteration == 2
+        assert get_loaded_dataloader_state(args) == {"cursor": 8}
+        assert torch.equal(model.l.weight, torch.full_like(model.l.weight, 4))

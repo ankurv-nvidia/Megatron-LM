@@ -31,7 +31,7 @@ from megatron.energon import (
 )
 from megatron.energon.errors import log_exception
 from megatron.training import get_args, get_run_config, get_train_state
-from megatron.training.checkpointing import get_checkpoint_name
+from megatron.training.checkpointing import get_checkpoint_name, get_loaded_dataloader_state
 
 
 def use_new_dataloader_path():
@@ -194,7 +194,22 @@ def train_valid_test_dataloaders_provider(
     # uses the checkpoint's resolved iteration and retains strict restore checks.
     checkpoint = get_run_config().checkpoint
     if restore_dataloader_state and checkpoint.load is not None:
-        if getattr(args, "dataloader_save", None):
+        state = get_loaded_dataloader_state(args)
+        if state is not None:
+            try:
+                train_dataloader.restore_state_rank(state)
+                print("restored dataset state from the model checkpoint")
+            except Exception as e:
+                if should_strictly_load_dataloader_state(args):
+                    raise RuntimeError(
+                        "Failed to restore dataloader state from the model checkpoint"
+                    ) from e
+                if rank == 0:
+                    print(
+                        f"Failed to restore dataloader state from the model checkpoint: {e}. "
+                        "Continuing without restoring dataloader state."
+                    )
+        elif getattr(args, "dataloader_save", None):
             train_state = get_train_state()
             iteration = train_state.iteration
             dp_rank = parallel_state.get_data_parallel_rank()

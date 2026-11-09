@@ -146,6 +146,7 @@ def strict_resume_provider(monkeypatch):
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kw: None)
     monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)
+    monkeypatch.setattr(dataloader_provider, "get_loaded_dataloader_state", lambda _args: None)
     monkeypatch.setattr(dataloader_provider, "get_checkpoint_name", checkpoint_name)
     monkeypatch.setattr(dataloader_provider.torch, "load", load_state)
     return args, loader, checkpoint_name, load_state, train_state
@@ -205,3 +206,66 @@ def test_initial_finetune_load_tolerates_missing_state(monkeypatch, strict_resum
     assert args.strict_dataloader_state_load
     load_state.assert_not_called()
     loader.restore_state_rank.assert_not_called()
+
+
+@pytest.mark.parametrize("state", [{"global_sequence_id": 24}, {}])
+@pytest.mark.parametrize("sidecar_path", [None, "/checkpoints/dataloader"])
+def test_embedded_dataloader_state_precedes_legacy_sidecar(
+    monkeypatch, strict_resume_provider, state, sidecar_path
+):
+    args, loader, checkpoint_name, load_state, _ = strict_resume_provider
+    args.dataloader_save = sidecar_path
+    monkeypatch.setattr(dataloader_provider, "get_loaded_dataloader_state", lambda _args: state)
+
+    dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
+
+    loader.restore_state_rank.assert_called_once_with(state)
+    checkpoint_name.assert_not_called()
+    load_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "restore_enabled,load_directory", [(False, "/checkpoints/model"), (True, None)]
+)
+def test_embedded_dataloader_state_respects_restore_guards(
+    monkeypatch, strict_resume_provider, restore_enabled, load_directory
+):
+    _, loader, checkpoint_name, load_state, _ = strict_resume_provider
+    get_state = Mock(return_value={"global_sequence_id": 24})
+    monkeypatch.setattr(dataloader_provider, "get_loaded_dataloader_state", get_state)
+    monkeypatch.setattr(
+        dataloader_provider, "get_run_config", lambda: _run_config(load=load_directory)
+    )
+
+    dataloader_provider.train_valid_test_dataloaders_provider(
+        None, task_encoder=object(), restore_dataloader_state=restore_enabled
+    )
+
+    get_state.assert_not_called()
+    loader.restore_state_rank.assert_not_called()
+    checkpoint_name.assert_not_called()
+    load_state.assert_not_called()
+
+
+@pytest.mark.parametrize("strict_load", [False, True])
+def test_invalid_embedded_state_preserves_restore_policy(
+    monkeypatch, strict_resume_provider, strict_load, capsys
+):
+    args, loader, checkpoint_name, load_state, _ = strict_resume_provider
+    args.strict_dataloader_state_load = strict_load
+    state = {"global_sequence_id": 24}
+    monkeypatch.setattr(dataloader_provider, "get_loaded_dataloader_state", lambda _args: state)
+    failure = ValueError("invalid loader state")
+    loader.restore_state_rank.side_effect = failure
+
+    if strict_load:
+        with pytest.raises(RuntimeError, match="model checkpoint") as error:
+            dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
+        assert error.value.__cause__ is failure
+    else:
+        dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
+        assert "Continuing without restoring dataloader state" in capsys.readouterr().out
+
+    loader.restore_state_rank.assert_called_once_with(state)
+    checkpoint_name.assert_not_called()
+    load_state.assert_not_called()
